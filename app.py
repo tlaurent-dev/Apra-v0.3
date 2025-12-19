@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import date
 import tempfile, os
+from io import StringIO
 
 from apra_core import (
     analyze_project,
@@ -13,7 +14,7 @@ from apra_core import (
 )
 
 # =========================
-# Status + styling
+# Status (traffic lights) + styling
 # =========================
 
 def task_status(risk_pct: float, green_lt: float, orange_lt: float) -> str:
@@ -54,6 +55,145 @@ def style_status_col(df: pd.DataFrame, col_name: str = "Status"):
             return "background-color: #FFBABA;"
         return ""
     return df.style.applymap(_style, subset=[col_name])
+
+# =========================
+# Trend history (Step 2)
+# =========================
+
+HISTORY_COLUMNS = [
+    "Snapshot Date", "Project",
+    "Delay %", "P80", "Planned (days)",
+    "Max Task Risk %", "Avg Task Risk %",
+    "Status", "PERT?"
+]
+
+def init_history():
+    if "apra_history" not in st.session_state:
+        st.session_state["apra_history"] = pd.DataFrame(columns=HISTORY_COLUMNS)
+
+def history_add_snapshot(snapshot_date: date, portfolio_df: pd.DataFrame):
+    """
+    Append current portfolio metrics into history table.
+    If same (Snapshot Date, Project) already exists, replace it.
+    """
+    init_history()
+    hist = st.session_state["apra_history"]
+
+    # Build snapshot rows from portfolio_df (which already has computed metrics/status)
+    rows = []
+    for _, r in portfolio_df.iterrows():
+        rows.append({
+            "Snapshot Date": snapshot_date.isoformat(),
+            "Project": r["Project"],
+            "Delay %": float(r["Delay %"]),
+            "P80": float(r["P80"]),
+            "Planned (days)": float(r["Planned (days)"]),
+            "Max Task Risk %": float(r["Max Task Risk %"]),
+            "Avg Task Risk %": float(r["Avg Task Risk %"]),
+            "Status": r["Status"],
+            "PERT?": r.get("PERT?", "No"),
+        })
+
+    snap_df = pd.DataFrame(rows, columns=HISTORY_COLUMNS)
+
+    # Remove duplicates for same snapshot date+project, then append
+    if not hist.empty:
+        key = ["Snapshot Date", "Project"]
+        hist = hist[~hist.set_index(key).index.isin(snap_df.set_index(key).index)]
+
+    hist = pd.concat([hist, snap_df], ignore_index=True)
+
+    # Sort for readability
+    hist["Snapshot Date"] = hist["Snapshot Date"].astype(str)
+    hist = hist.sort_values(["Snapshot Date", "Project"], ascending=[True, True]).reset_index(drop=True)
+
+    st.session_state["apra_history"] = hist
+
+def history_to_csv_bytes() -> bytes:
+    init_history()
+    return st.session_state["apra_history"].to_csv(index=False).encode("utf-8")
+
+def history_load_from_uploaded(file) -> None:
+    init_history()
+    try:
+        df = pd.read_csv(file)
+        # Basic schema check
+        missing = [c for c in HISTORY_COLUMNS if c not in df.columns]
+        if missing:
+            st.error(f"Uploaded history CSV is missing columns: {', '.join(missing)}")
+            st.stop()
+        st.session_state["apra_history"] = df[HISTORY_COLUMNS].copy()
+    except Exception as e:
+        st.error(f"Failed to load history CSV: {e}")
+        st.stop()
+
+def compute_trends(history_df: pd.DataFrame, current_portfolio_df: pd.DataFrame):
+    """
+    For each project, compare most recent snapshot to previous snapshot (if exists).
+    Detect:
+    - Delay % drift and arrow
+    - New Red since previous snapshot
+    """
+    if history_df.empty or current_portfolio_df.empty:
+        return pd.DataFrame()
+
+    hist = history_df.copy()
+    hist["Snapshot Date"] = pd.to_datetime(hist["Snapshot Date"], errors="coerce")
+    hist = hist.dropna(subset=["Snapshot Date"])
+
+    # Only consider projects currently in portfolio_df (so trends align with visible set)
+    current = current_portfolio_df[["Project", "Delay %", "Status", "Max Task Risk %", "P80"]].copy()
+    current.rename(columns={"Delay %": "Current Delay %", "Status": "Current Status",
+                            "Max Task Risk %": "Current Max Task Risk %", "P80": "Current P80"}, inplace=True)
+
+    rows = []
+    for proj in current["Project"].tolist():
+        ph = hist[hist["Project"] == proj].sort_values("Snapshot Date")
+        if len(ph) < 1:
+            continue
+
+        # Latest snapshot in history
+        latest = ph.iloc[-1]
+        prev = ph.iloc[-2] if len(ph) >= 2 else None
+
+        curr_delay = float(current.loc[current["Project"] == proj, "Current Delay %"].iloc[0])
+        curr_status = current.loc[current["Project"] == proj, "Current Status"].iloc[0]
+
+        # Compare current vs last snapshot (not necessarily the same "today" date)
+        last_delay = float(latest["Delay %"])
+        delta = curr_delay - last_delay
+
+        if abs(delta) < 0.75:
+            arrow = "→"
+        elif delta > 0:
+            arrow = "↑"
+        else:
+            arrow = "↓"
+
+        # New red detection: became Red now, but last snapshot was not Red
+        last_bucket = status_bucket(str(latest["Status"]))
+        now_bucket = status_bucket(str(curr_status))
+        new_red = (now_bucket == "Red" and last_bucket != "Red")
+
+        # If we have a previous snapshot, also show last drift from prev to latest
+        if prev is not None:
+            prev_delay = float(prev["Delay %"])
+        else:
+            prev_delay = None
+
+        rows.append({
+            "Project": proj,
+            "Current Status": curr_status,
+            "Current Delay %": round(curr_delay, 2),
+            "Last Snapshot Date": latest["Snapshot Date"].date().isoformat(),
+            "Last Delay %": round(last_delay, 2),
+            "Δ vs Last": round(delta, 2),
+            "Trend": arrow,
+            "New Red?": "YES" if new_red else "",
+            "Prev Snapshot Delay %": "" if prev_delay is None else round(prev_delay, 2),
+        })
+
+    return pd.DataFrame(rows)
 
 # =========================
 # Helpers
@@ -158,6 +298,7 @@ st.set_page_config(page_title="APRA Portfolio Dashboard", layout="wide")
 st.title("APRA — Project Risk Dashboard")
 
 init_overrides()
+init_history()
 
 with st.sidebar:
     st.header("Navigation")
@@ -192,6 +333,25 @@ with st.sidebar:
     portfolio_status_filter = st.selectbox("Show projects", ["All", "Green", "Orange", "Red"], index=0)
     portfolio_sort = st.selectbox("Sort projects by", ["Delay % (desc)", "Max Task Risk % (desc)", "Project (A→Z)"], index=0)
     min_top_task_risk = st.slider("Top risks: minimum task risk (%)", 0, 100, 50, step=5)
+
+    st.divider()
+    st.header("Trends History (Step 2)")
+    st.caption("Add snapshots over time, download/upload history to preserve trends across sessions.")
+    history_upload = st.file_uploader("Upload history CSV", type=["csv"], key="history_upload")
+    if history_upload is not None:
+        history_load_from_uploaded(history_upload)
+        st.success("History loaded.")
+
+    st.download_button(
+        "Download history CSV",
+        data=history_to_csv_bytes(),
+        file_name="apra_history.csv",
+        mime="text/csv"
+    )
+
+    if st.button("Clear history"):
+        st.session_state["apra_history"] = pd.DataFrame(columns=HISTORY_COLUMNS)
+        st.success("History cleared.")
 
 # Normalize thresholds even if inverted
 task_green = float(min(task_green_lt, task_orange_lt))
@@ -287,15 +447,40 @@ if not top_tasks_df.empty:
     top_tasks_df = top_tasks_df.sort_values("Propagated Risk %", ascending=False).head(10)
 
 # =========================
+# Trends section (available in both views)
+# =========================
+
+trend_df = compute_trends(st.session_state["apra_history"], portfolio_view_df)
+
+# =========================
 # View: Portfolio
 # =========================
 
 if view_mode == "Portfolio":
     st.subheader("Portfolio Summary")
+
+    cA, cB = st.columns([1, 3])
+    with cA:
+        if st.button("Add snapshot (Today)"):
+            # Add snapshot using the unfiltered portfolio table? Use filtered view to match what user sees.
+            history_add_snapshot(today, portfolio_view_df if not portfolio_view_df.empty else portfolio_df.drop(columns=["Bucket"], errors="ignore"))
+            st.success(f"Snapshot added for {today.isoformat()}.")
+
     if portfolio_view_df.empty:
         st.info("No projects match the current filter.")
     else:
         st.dataframe(style_status_col(portfolio_view_df, "Status"), use_container_width=True)
+
+    st.subheader("Trend Summary (Drift + New Reds)")
+    if trend_df.empty:
+        st.info("Add at least one snapshot to enable trends.")
+    else:
+        # Highlight New Red? column visually by keeping it simple
+        st.dataframe(trend_df, use_container_width=True)
+
+        new_reds = trend_df[trend_df["New Red?"] == "YES"]
+        if not new_reds.empty:
+            st.warning(f"New Reds detected: {', '.join(new_reds['Project'].tolist())}")
 
     st.subheader("Top Risks Across Portfolio (Top 10 tasks)")
     if top_tasks_df.empty:
@@ -303,8 +488,11 @@ if view_mode == "Portfolio":
     else:
         st.dataframe(style_status_col(top_tasks_df, "Status"), use_container_width=True)
 
+    st.subheader("History (Raw)")
+    st.dataframe(st.session_state["apra_history"], use_container_width=True)
+
 # =========================
-# View: Project details (includes Step 1 root-cause)
+# View: Project details (includes Step 1 root-cause + Step 2 trend summary)
 # =========================
 
 else:
@@ -312,6 +500,16 @@ else:
     selected_project = st.selectbox("Select a project", sorted(list(projects.keys())))
     df_in = projects[selected_project]
     project_overrides = get_project_overrides(selected_project)
+
+    # Project-level trend strip (if history exists)
+    hist = st.session_state["apra_history"]
+    proj_hist = hist[hist["Project"] == selected_project].copy()
+    if not proj_hist.empty:
+        proj_hist["Snapshot Date"] = pd.to_datetime(proj_hist["Snapshot Date"], errors="coerce")
+        proj_hist = proj_hist.dropna(subset=["Snapshot Date"]).sort_values("Snapshot Date")
+        st.subheader("Project Trend (Delay % over snapshots)")
+        chart_df = proj_hist.set_index("Snapshot Date")[["Delay %"]]
+        st.line_chart(chart_df)
 
     st.subheader("What-if controls (Selected project)")
     st.caption("Override Optimistic / MostLikely / Pessimistic (and Progress) for a task. This does not edit your CSV file.")
@@ -377,10 +575,8 @@ else:
     summary = summarize_samples(planned, samples)
     delay_pct_sel = float(summary["delay_probability_pct"])
 
-    # Big status badge
     st.markdown(f"## Project Status: {project_status(delay_pct_sel, proj_green, proj_orange)}")
 
-    # Step 1: Root-cause explanation
     explanation = explain_project_risk(
         df=df,
         critical_path=critical_path,
@@ -418,7 +614,6 @@ else:
     ]
     st.dataframe(style_status_col(df_disp[display_cols], "Status"), use_container_width=True)
 
-    # Charts
     left, right = st.columns(2)
     with left:
         st.pyplot(make_task_risk_fig(df), clear_figure=True)
