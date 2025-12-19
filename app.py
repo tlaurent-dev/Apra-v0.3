@@ -15,6 +15,118 @@ from apra_core import (
 )
 
 # =========================
+# UI Settings (SAFE - Step 7)
+# =========================
+# Design goal: add settings without touching business logic
+# - No new dependencies
+# - No new navigation view required
+# - Uses CSS injection only (Streamlit-safe)
+# - Defaults persist for the session via st.session_state
+
+def init_ui_settings():
+    st.session_state.setdefault("ui_theme", "Professional Light")
+    st.session_state.setdefault("ui_font", "System")
+    st.session_state.setdefault("ui_density", "Comfortable")
+
+
+THEMES = {
+    "Professional Light": {"bg": "#ffffff", "panel": "#f7f7f9", "text": "#111827", "grid": "#e5e7eb"},
+    "Executive Dark": {"bg": "#0f172a", "panel": "#111827", "text": "#f9fafb", "grid": "#334155"},
+    "High Contrast": {"bg": "#0b0b0b", "panel": "#141414", "text": "#ffffff", "grid": "#6b7280"},
+    "Minimal Gray": {"bg": "#f3f4f6", "panel": "#ffffff", "text": "#111827", "grid": "#d1d5db"},
+}
+
+FONTS = {
+    "System": 'system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif',
+    "Georgia": 'Georgia, "Times New Roman", Times, serif',
+    "Monospace": 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+}
+
+DENSITY = {
+    "Comfortable": {"font": "0.95rem", "pad": "0.75rem"},
+    "Compact": {"font": "0.90rem", "pad": "0.35rem"},
+}
+
+def apply_ui_theme():
+    t = THEMES.get(st.session_state.get("ui_theme", "Professional Light"), THEMES["Professional Light"])
+    font = FONTS.get(st.session_state.get("ui_font", "System"), FONTS["System"])
+    d = DENSITY.get(st.session_state.get("ui_density", "Comfortable"), DENSITY["Comfortable"])
+
+    st.markdown(
+        f"""
+        <style>
+          :root {{
+            --apra-bg: {t["bg"]};
+            --apra-panel: {t["panel"]};
+            --apra-text: {t["text"]};
+            --apra-grid: {t["grid"]};
+            --apra-font-size: {d["font"]};
+            --apra-pad: {d["pad"]};
+          }}
+
+          html, body, [class*="stApp"] {{
+            background: var(--apra-bg) !important;
+            color: var(--apra-text) !important;
+            font-family: {font} !important;
+            font-size: var(--apra-font-size) !important;
+          }}
+
+          [data-testid="stSidebar"] {{
+            background: var(--apra-panel) !important;
+            border-right: 1px solid var(--apra-grid) !important;
+          }}
+
+          /* Metric cards */
+          [data-testid="stMetric"] {{
+            background: var(--apra-panel) !important;
+            border: 1px solid var(--apra-grid) !important;
+            border-radius: 14px !important;
+            padding: var(--apra-pad) !important;
+          }}
+
+          /* Buttons */
+          .stButton > button {{
+            border-radius: 10px !important;
+            border: 1px solid var(--apra-grid) !important;
+            padding: calc(var(--apra-pad) * 0.7) var(--apra-pad) !important;
+          }}
+
+          /* Inputs */
+          input, textarea {{
+            border-radius: 10px !important;
+          }}
+        
+          /* Improve contrast for common Streamlit elements */
+          a, a:visited {{ color: #60a5fa !important; }}
+          .stMarkdown, .stText, .stCaption, .stMarkdown p, .stMarkdown li {{ color: var(--apra-text) !important; }}
+          .stCaption {{ opacity: 0.88; }}
+
+          /* Widget labels */
+          label, .stSelectbox label, .stRadio label, .stSlider label, .stNumberInput label {{
+            color: var(--apra-text) !important;
+          }}
+
+          /* Dataframe container (outer frame) */
+          [data-testid="stDataFrame"] {{
+            background: var(--apra-panel) !important;
+            border: 1px solid var(--apra-grid) !important;
+            border-radius: 14px !important;
+            padding: calc(var(--apra-pad) * 0.6) !important;
+          }}
+
+          /* Expanders */
+          [data-testid="stExpander"] {{
+            background: var(--apra-panel) !important;
+            border: 1px solid var(--apra-grid) !important;
+            border-radius: 14px !important;
+          }}
+
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# =========================
 # Status + styling
 # =========================
 
@@ -433,6 +545,9 @@ def any_row_has_pert_values(df):
 # =========================
 
 st.set_page_config(page_title="APRA Portfolio Dashboard", layout="wide")
+init_ui_settings()
+apply_ui_theme()
+
 st.title("APRA — Project Risk Dashboard")
 
 init_overrides()
@@ -475,6 +590,14 @@ with st.sidebar:
         history_load_from_uploaded(history_upload)
         st.success("History loaded.")
     st.download_button("Download history CSV", data=history_to_csv_bytes(), file_name="apra_history.csv", mime="text/csv")
+
+    # SAFE UI settings panel (does not affect computations)
+    st.divider()
+    st.subheader("UI Settings")
+    st.selectbox("Theme", list(THEMES.keys()), key="ui_theme")
+    st.selectbox("Font", list(FONTS.keys()), key="ui_font")
+    st.selectbox("Density", list(DENSITY.keys()), key="ui_density")
+    apply_ui_theme()
 
 task_green = float(min(task_green_lt, task_orange_lt))
 task_orange = float(max(task_green_lt, task_orange_lt))
