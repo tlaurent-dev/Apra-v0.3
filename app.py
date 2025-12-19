@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
-from datetime import date
+from datetime import date, datetime
 import tempfile, os
+import io
 
 from apra_core import (
     analyze_project,
@@ -213,14 +214,9 @@ def ensure_owner_columns(df: pd.DataFrame) -> pd.DataFrame:
 def build_open_items_by_owner(project_name: str, df_tasks: pd.DataFrame,
                               proj_delay_pct: float, proj_expected_cost: float,
                               task_green: float, task_orange: float):
-    """
-    Returns a task-level table of OPEN items (Orange/Red), with attributed cost.
-    Attribution: distribute project expected delay cost across open tasks proportionally by Propagated Risk %.
-    """
     d = df_tasks.copy()
     d["Propagated Risk %"] = d["Propagated Risk %"].astype(float)
     d["Progress"] = d["Progress"].astype(float)
-
     d = ensure_owner_columns(d)
 
     d["Task Status"] = d["Propagated Risk %"].apply(lambda x: task_status(float(x), task_green, task_orange))
@@ -230,7 +226,6 @@ def build_open_items_by_owner(project_name: str, df_tasks: pd.DataFrame,
     if open_df.empty:
         return open_df
 
-    # cost attribution weights
     risk_sum = float(open_df["Propagated Risk %"].sum())
     if risk_sum <= 0:
         open_df["Attributed Cost ($)"] = 0.0
@@ -239,7 +234,7 @@ def build_open_items_by_owner(project_name: str, df_tasks: pd.DataFrame,
             lambda r: (float(r) / risk_sum) * float(proj_expected_cost)
         )
 
-    # FIX: handle CSVs that already include a "Project" column
+    # FIX: avoid duplicate "Project" column
     if "Project" not in open_df.columns:
         open_df.insert(0, "Project", project_name)
     else:
@@ -274,7 +269,6 @@ def summarize_open_items_by_owner(open_items_df: pd.DataFrame, owner_field: str)
 
     d = open_items_df.copy()
     d["Owner"] = d[owner_field].astype(str).fillna("Unassigned").replace({"": "Unassigned"})
-
     d["Is Red"] = d["Task Status"].apply(lambda s: 1 if "🟥" in str(s) else 0)
     d["Is Orange"] = d["Task Status"].apply(lambda s: 1 if "🟧" in str(s) else 0)
 
@@ -287,9 +281,92 @@ def summarize_open_items_by_owner(open_items_df: pd.DataFrame, owner_field: str)
     )
     g["Attributed_Cost_USD"] = g["Attributed_Cost_USD"].round(2)
     g["Avg_Task_Risk_Pct"] = g["Avg_Task_Risk_Pct"].round(2)
+    return g.sort_values(["Attributed_Cost_USD", "Red_Items"], ascending=[False, False])
 
-    g = g.sort_values(["Attributed_Cost_USD", "Red_Items"], ascending=[False, False])
-    return g
+# =========================
+# Weekly Auto-Reports (Step 6)
+# =========================
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+def _pdf_make_table(df: pd.DataFrame, max_rows: int = 35):
+    from reportlab.platypus import Table, TableStyle
+    from reportlab.lib import colors
+
+    if df is None or df.empty:
+        data = [["(no data)"]]
+        t = Table(data)
+        t.setStyle(TableStyle([("GRID", (0,0), (-1,-1), 0.5, colors.grey)]))
+        return t
+
+    d = df.copy().head(max_rows)
+    data = [list(d.columns)] + d.astype(str).values.tolist()
+
+    t = Table(data, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 8),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.white]),
+    ]))
+    return t
+
+def make_owner_weekly_pdf(run_dt: datetime, owner_field: str, owner_summary: pd.DataFrame, open_items: pd.DataFrame) -> bytes:
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+
+    buff = io.BytesIO()
+    doc = SimpleDocTemplate(buff, pagesize=letter, title="APRA Weekly Owner Report")
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("APRA — Weekly Owner Report", styles["Title"]))
+    story.append(Paragraph(f"Run date: {run_dt.strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
+    story.append(Paragraph(f"Grouping: {owner_field}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Owner Summary (Open Items)", styles["Heading2"]))
+    story.append(_pdf_make_table(owner_summary, max_rows=30))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Open Items Detail (Top by Attributed Cost)", styles["Heading2"]))
+    detail = open_items.sort_values("Attributed Cost ($)", ascending=False) if not open_items.empty else open_items
+    story.append(_pdf_make_table(detail, max_rows=35))
+
+    doc.build(story)
+    return buff.getvalue()
+
+def make_project_weekly_pdf(run_dt: datetime, portfolio_df: pd.DataFrame, top_cost_df: pd.DataFrame, trends_df: pd.DataFrame) -> bytes:
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+
+    buff = io.BytesIO()
+    doc = SimpleDocTemplate(buff, pagesize=letter, title="APRA Weekly Project Report")
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("APRA — Weekly Project Report", styles["Title"]))
+    story.append(Paragraph(f"Run date: {run_dt.strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Portfolio Summary", styles["Heading2"]))
+    story.append(_pdf_make_table(portfolio_df, max_rows=25))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Top Cost Risks", styles["Heading2"]))
+    story.append(_pdf_make_table(top_cost_df, max_rows=15))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Trend Summary (Drift + New Reds)", styles["Heading2"]))
+    story.append(_pdf_make_table(trends_df, max_rows=20))
+
+    doc.build(story)
+    return buff.getvalue()
 
 # =========================
 # Helpers
@@ -307,7 +384,6 @@ def analyze_project_from_df(df_in, today):
         except Exception:
             pass
 
-
 def validate_csv(df):
     required = ["Task", "Start", "Due", "Progress"]
     missing = [c for c in required if c not in df.columns]
@@ -315,44 +391,12 @@ def validate_csv(df):
         st.error(f"Missing required columns: {', '.join(missing)}")
         st.stop()
 
-    pert_cols = ["Optimistic", "MostLikely", "Pessimistic"]
-    has_any_pert = any(c in df.columns for c in pert_cols)
-
-    if has_any_pert:
-        for c in pert_cols:
-            if c not in df.columns:
-                st.error(f"If you use PERT, your CSV must include all three columns: {', '.join(pert_cols)}")
-                st.stop()
-
-        bad_rows = []
-        for i, r in df.iterrows():
-            vals = [r.get("Optimistic"), r.get("MostLikely"), r.get("Pessimistic")]
-            if all(pd.isna(v) or str(v).strip() == "" for v in vals):
-                continue
-            try:
-                o = float(r["Optimistic"])
-                m = float(r["MostLikely"])
-                p = float(r["Pessimistic"])
-                if not (o <= m <= p):
-                    bad_rows.append((i + 2, r.get("Task", f"Row{i+2}"),
-                                     "Must satisfy Optimistic <= MostLikely <= Pessimistic"))
-            except Exception:
-                bad_rows.append((i + 2, r.get("Task", f"Row{i+2}"), "PERT values must be numeric"))
-
-        if bad_rows:
-            msg = "Invalid PERT rows found (CSV row numbers shown):\n\n"
-            msg += "\n".join([f"- Row {rn} ({task}): {reason}" for rn, task, reason in bad_rows[:15]])
-            st.error(msg)
-            st.stop()
-
-
 def ensure_pert_columns(df):
     df2 = df.copy()
     for c in ["Optimistic", "MostLikely", "Pessimistic"]:
         if c not in df2.columns:
             df2[c] = ""
     return df2
-
 
 def init_overrides():
     if "overrides_by_project" not in st.session_state:
@@ -397,7 +441,7 @@ init_cost_overrides()
 
 with st.sidebar:
     st.header("Navigation")
-    view_mode = st.radio("View", ["Portfolio", "Project details", "Owners"], index=0)
+    view_mode = st.radio("View", ["Portfolio", "Project details", "Owners", "Reports"], index=0)
 
     st.divider()
     st.header("Inputs")
@@ -432,7 +476,6 @@ with st.sidebar:
         st.success("History loaded.")
     st.download_button("Download history CSV", data=history_to_csv_bytes(), file_name="apra_history.csv", mime="text/csv")
 
-# Normalize thresholds
 task_green = float(min(task_green_lt, task_orange_lt))
 task_orange = float(max(task_green_lt, task_orange_lt))
 proj_green = float(min(proj_green_lt, proj_orange_lt))
@@ -459,13 +502,12 @@ for name, df_tmp in list(projects.items()):
     projects[name] = df_tmp
 
 # =========================
-# Build portfolio summary + open-items tables (Step 5)
+# Build portfolio summary + open-items tables
 # =========================
 
 summary_rows = []
 top_risk_tasks = []
 all_open_items = []
-project_analysis_cache = {}
 
 for name, df_tmp in projects.items():
     df_an, cpath, graph = analyze_project_from_df(df_tmp, today)
@@ -522,15 +564,6 @@ for name, df_tmp in projects.items():
             "Progress %": float(r["Progress"]),
         })
 
-    project_analysis_cache[name] = {
-        "df": df_an,
-        "critical_path": cpath,
-        "graph": graph,
-        "summary": summ,
-        "delay_pct": delay_pct,
-        "expected_cost": exp_cost,
-    }
-
 portfolio_df = pd.DataFrame(summary_rows)
 if not portfolio_df.empty:
     if portfolio_sort == "Expected Delay Cost (desc)":
@@ -553,7 +586,6 @@ if not top_tasks_df.empty:
     top_tasks_df = top_tasks_df.sort_values("Propagated Risk %", ascending=False).head(10)
 
 trend_df = compute_trends(st.session_state["apra_history"], portfolio_view_df)
-
 open_items_all = pd.concat(all_open_items, ignore_index=True) if all_open_items else pd.DataFrame()
 
 # =========================
@@ -569,7 +601,7 @@ if view_mode == "Portfolio":
         c1.metric("Total Expected Delay Cost ($)", f"{total_expected_cost:,.2f}")
         c2.metric("Projects shown", int(len(portfolio_view_df)))
 
-    cA, cB = st.columns([1, 3])
+    cA, _ = st.columns([1, 3])
     with cA:
         if st.button("Add snapshot (Today)"):
             history_add_snapshot(today, portfolio_view_df)
@@ -608,11 +640,8 @@ if view_mode == "Portfolio":
     else:
         st.dataframe(style_status_col(top_tasks_df, "Status"), use_container_width=True)
 
-    st.subheader("History (Raw)")
-    st.dataframe(st.session_state["apra_history"], use_container_width=True)
-
 # =========================
-# View: Project details (Steps 1–5)
+# View: Project details
 # =========================
 
 elif view_mode == "Project details":
@@ -620,14 +649,6 @@ elif view_mode == "Project details":
     selected_project = st.selectbox("Select a project", sorted(list(projects.keys())))
     df_in = projects[selected_project]
     project_overrides = get_project_overrides(selected_project)
-
-    hist = st.session_state["apra_history"]
-    proj_hist = hist[hist["Project"] == selected_project].copy()
-    if not proj_hist.empty:
-        proj_hist["Snapshot Date"] = pd.to_datetime(proj_hist["Snapshot Date"], errors="coerce")
-        proj_hist = proj_hist.dropna(subset=["Snapshot Date"]).sort_values("Snapshot Date")
-        st.subheader("Project Trend (Delay % over snapshots)")
-        st.line_chart(proj_hist.set_index("Snapshot Date")[["Delay %"]])
 
     df_for_analysis = apply_overrides(df_in, project_overrides)
     df, critical_path, graph = analyze_project_from_df(df_for_analysis, today)
@@ -685,8 +706,7 @@ elif view_mode == "Project details":
         st.dataframe(actions_df, use_container_width=True)
 
     st.subheader("Task Table (with Ownership)")
-    df_disp = df.copy()
-    df_disp = ensure_owner_columns(df_disp)
+    df_disp = ensure_owner_columns(df.copy())
     df_disp["Status"] = df_disp["Propagated Risk %"].apply(lambda x: task_status(float(x), task_green, task_orange))
 
     display_cols = [
@@ -704,10 +724,10 @@ elif view_mode == "Project details":
         st.pyplot(make_monte_carlo_fig(samples, planned), clear_figure=True)
 
 # =========================
-# View: Owners (Step 5)
+# View: Owners
 # =========================
 
-else:
+elif view_mode == "Owners":
     st.subheader("Open Items by Owner")
 
     if open_items_all.empty:
@@ -718,7 +738,6 @@ else:
 
     owners = sorted(open_items_all[owner_field].astype(str).fillna("Unassigned").replace({"": "Unassigned"}).unique().tolist())
     selected_owner = st.selectbox("Owner", ["All"] + owners, index=0)
-
     severity_filter = st.multiselect("Severity", ["🟥 High risk", "🟧 Recoverable"], default=["🟥 High risk", "🟧 Recoverable"])
 
     d = open_items_all.copy()
@@ -742,3 +761,92 @@ else:
         "Attributed Cost ($)", "Project Delay %", "Start", "Due"
     ]
     st.dataframe(d[show_cols].sort_values(["Attributed Cost ($)"], ascending=False), use_container_width=True)
+
+# =========================
+# View: Reports (Step 6)
+# =========================
+
+else:
+    st.subheader("Weekly Auto-Reports (PDF / CSV)")
+
+    run_dt = datetime.now()
+
+    tab1, tab2 = st.tabs(["By Owner", "By Project"])
+
+    with tab1:
+        if open_items_all.empty:
+            st.info("No open items to report (no Orange/Red tasks).")
+        else:
+            owner_field = st.radio("Group by", ["Risk Owner", "Task Owner"], index=0, horizontal=True, key="rep_owner_group")
+            severity_filter = st.multiselect("Include severities", ["🟥 High risk", "🟧 Recoverable"], default=["🟥 High risk", "🟧 Recoverable"], key="rep_owner_sev")
+
+            d = open_items_all.copy()
+            d = d[d["Task Status"].isin(severity_filter)]
+
+            owner_summary = summarize_open_items_by_owner(d, owner_field=owner_field)
+            d_detail = d.sort_values("Attributed Cost ($)", ascending=False)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Open items", int(len(d_detail)))
+            c2.metric("Total attributed cost ($)", f"{float(d_detail['Attributed Cost ($)'].sum()):,.2f}" if not d_detail.empty else "0.00")
+            c3.metric("Owners", int(owner_summary["Owner"].nunique()) if not owner_summary.empty else 0)
+
+            st.dataframe(owner_summary, use_container_width=True)
+            st.dataframe(d_detail, use_container_width=True)
+
+            st.download_button(
+                "Download Owner Summary CSV",
+                data=df_to_csv_bytes(owner_summary),
+                file_name=f"apra_owner_summary_{run_dt.strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+            st.download_button(
+                "Download Open Items CSV",
+                data=df_to_csv_bytes(d_detail),
+                file_name=f"apra_open_items_{run_dt.strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+            st.download_button(
+                "Download Owner Report PDF",
+                data=make_owner_weekly_pdf(run_dt, owner_field, owner_summary, d_detail),
+                file_name=f"apra_owner_report_{run_dt.strftime('%Y%m%d')}.pdf",
+                mime="application/pdf"
+            )
+
+    with tab2:
+        if portfolio_view_df.empty:
+            st.info("No portfolio data loaded.")
+        else:
+            portfolio_out = portfolio_view_df.copy()
+            top_cost = portfolio_out.sort_values("Expected Delay Cost ($)", ascending=False).head(10)
+            trends_out = trend_df.copy() if isinstance(trend_df, pd.DataFrame) else pd.DataFrame()
+
+            total_expected_cost = float(portfolio_out["Expected Delay Cost ($)"].sum()) if "Expected Delay Cost ($)" in portfolio_out.columns else 0.0
+            c1, c2 = st.columns(2)
+            c1.metric("Projects", int(len(portfolio_out)))
+            c2.metric("Total Expected Delay Cost ($)", f"{total_expected_cost:,.2f}")
+
+            st.subheader("Portfolio Summary (filtered)")
+            st.dataframe(style_status_col(portfolio_out, "Status"), use_container_width=True)
+
+            st.subheader("Top Cost Risks")
+            st.dataframe(top_cost[["Status","Project","Delay %","Expected Delay Days","Cost/day ($)","Expected Delay Cost ($)"]], use_container_width=True)
+
+            st.subheader("Trend Summary")
+            if trends_out.empty:
+                st.caption("No trends available (add at least one snapshot).")
+            else:
+                st.dataframe(trends_out, use_container_width=True)
+
+            st.download_button(
+                "Download Portfolio CSV",
+                data=df_to_csv_bytes(portfolio_out),
+                file_name=f"apra_portfolio_{run_dt.strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+            st.download_button(
+                "Download Project Report PDF",
+                data=make_project_weekly_pdf(run_dt, portfolio_out, top_cost, trends_out),
+                file_name=f"apra_project_report_{run_dt.strftime('%Y%m%d')}.pdf",
+                mime="application/pdf"
+            )
