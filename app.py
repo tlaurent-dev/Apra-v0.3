@@ -221,6 +221,8 @@ def build_open_items_by_owner(project_name: str, df_tasks: pd.DataFrame,
     d["Propagated Risk %"] = d["Propagated Risk %"].astype(float)
     d["Progress"] = d["Progress"].astype(float)
 
+    d = ensure_owner_columns(d)
+
     d["Task Status"] = d["Propagated Risk %"].apply(lambda x: task_status(float(x), task_green, task_orange))
     open_mask = d["Task Status"].isin(["🟧 Recoverable", "🟥 High risk"])
     open_df = d.loc[open_mask].copy()
@@ -237,10 +239,14 @@ def build_open_items_by_owner(project_name: str, df_tasks: pd.DataFrame,
             lambda r: (float(r) / risk_sum) * float(proj_expected_cost)
         )
 
-    open_df.insert(0, "Project", project_name)
+    # FIX: handle CSVs that already include a "Project" column
+    if "Project" not in open_df.columns:
+        open_df.insert(0, "Project", project_name)
+    else:
+        open_df["Project"] = open_df["Project"].fillna(project_name)
+
     open_df["Project Delay %"] = float(proj_delay_pct)
 
-    # Keep key fields
     keep = [
         "Project",
         "Project Delay %",
@@ -282,7 +288,6 @@ def summarize_open_items_by_owner(open_items_df: pd.DataFrame, owner_field: str)
     g["Attributed_Cost_USD"] = g["Attributed_Cost_USD"].round(2)
     g["Avg_Task_Risk_Pct"] = g["Avg_Task_Risk_Pct"].round(2)
 
-    # Sort by highest cost, then reds
     g = g.sort_values(["Attributed_Cost_USD", "Red_Items"], ascending=[False, False])
     return g
 
@@ -450,7 +455,7 @@ else:
 for name, df_tmp in list(projects.items()):
     validate_csv(df_tmp)
     df_tmp = ensure_pert_columns(df_tmp)
-    df_tmp = ensure_owner_columns(df_tmp)  # Step 5
+    df_tmp = ensure_owner_columns(df_tmp)
     projects[name] = df_tmp
 
 # =========================
@@ -459,10 +464,8 @@ for name, df_tmp in list(projects.items()):
 
 summary_rows = []
 top_risk_tasks = []
-all_open_items = []  # aggregated across projects for Owners view
-
-# Keep project-level baseline artifacts for later views
-project_analysis_cache = {}  # name -> dict(df, critical_path, graph, summary, expected_cost, delay_pct)
+all_open_items = []
+project_analysis_cache = {}
 
 for name, df_tmp in projects.items():
     df_an, cpath, graph = analyze_project_from_df(df_tmp, today)
@@ -497,7 +500,6 @@ for name, df_tmp in projects.items():
         "Expected Delay Cost ($)": round(exp_cost, 2),
     })
 
-    # Open items per project (Step 5)
     open_df = build_open_items_by_owner(
         project_name=name,
         df_tasks=df_an,
@@ -509,7 +511,6 @@ for name, df_tmp in projects.items():
     if not open_df.empty:
         all_open_items.append(open_df)
 
-    # top risks for portfolio
     dtop = df_an.sort_values("Propagated Risk %", ascending=False).head(3)
     for _, r in dtop.iterrows():
         tstat = task_status(float(r["Propagated Risk %"]), task_green, task_orange)
@@ -620,7 +621,6 @@ elif view_mode == "Project details":
     df_in = projects[selected_project]
     project_overrides = get_project_overrides(selected_project)
 
-    # Trend chart (if history exists)
     hist = st.session_state["apra_history"]
     proj_hist = hist[hist["Project"] == selected_project].copy()
     if not proj_hist.empty:
@@ -629,19 +629,17 @@ elif view_mode == "Project details":
         st.subheader("Project Trend (Delay % over snapshots)")
         st.line_chart(proj_hist.set_index("Snapshot Date")[["Delay %"]])
 
-    # Run analysis with overrides applied
     df_for_analysis = apply_overrides(df_in, project_overrides)
     df, critical_path, graph = analyze_project_from_df(df_for_analysis, today)
 
     with st.spinner("Running Monte Carlo for selected project..."):
-        planned, samples = monte_carlo_project_duration(df, graph, sims=1500)
+        planned, samples = monte_carlo_project_duration(df, graph, sims=sims_project)
 
     summary = summarize_samples(planned, samples)
     delay_pct_sel = float(summary["delay_probability_pct"])
 
     st.markdown(f"## Project Status: {project_status(delay_pct_sel, proj_green, proj_orange)}")
 
-    # Step 4 metrics
     cost_day = get_cost_per_day(selected_project, default_cost_per_day)
     exp_days = expected_delay_days(summary["planned_days"], summary["p80_days"])
     exp_cost = expected_delay_cost(delay_pct_sel, exp_days, cost_day)
@@ -651,7 +649,6 @@ elif view_mode == "Project details":
     c2.metric("Expected Delay Days (P80−Plan)", f"{exp_days:,.2f}")
     c3.metric("Expected Delay Cost ($)", f"{exp_cost:,.2f}")
 
-    # Step 1: Root-cause
     explanation = explain_project_risk(
         df=df,
         critical_path=critical_path,
@@ -670,7 +667,6 @@ elif view_mode == "Project details":
     for line in explanation["driver_bullets"]:
         st.markdown(line)
 
-    # Step 3: Action Prioritization
     st.subheader("Action Prioritization (Impact-ranked)")
     with st.spinner("Estimating impact of corrective actions..."):
         actions_df = recommend_actions(
@@ -688,7 +684,6 @@ elif view_mode == "Project details":
     else:
         st.dataframe(actions_df, use_container_width=True)
 
-    # Task table (now includes owners)
     st.subheader("Task Table (with Ownership)")
     df_disp = df.copy()
     df_disp = ensure_owner_columns(df_disp)
@@ -721,7 +716,6 @@ else:
 
     owner_field = st.radio("Group by", ["Risk Owner", "Task Owner"], index=0, horizontal=True)
 
-    # Owner filter
     owners = sorted(open_items_all[owner_field].astype(str).fillna("Unassigned").replace({"": "Unassigned"}).unique().tolist())
     selected_owner = st.selectbox("Owner", ["All"] + owners, index=0)
 
@@ -733,7 +727,6 @@ else:
         d = d[d[owner_field] == selected_owner]
     d = d[d["Task Status"].isin(severity_filter)]
 
-    # Summary by owner
     st.subheader("Owner Summary")
     summary_by_owner = summarize_open_items_by_owner(d, owner_field=owner_field)
     if summary_by_owner.empty:
@@ -741,7 +734,6 @@ else:
     else:
         st.dataframe(summary_by_owner, use_container_width=True)
 
-    # Open items detail
     st.subheader("Open Items Detail")
     show_cols = [
         "Project", "Task Status", "Task",
