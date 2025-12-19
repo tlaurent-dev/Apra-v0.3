@@ -126,9 +126,8 @@ def compute_trends(history_df: pd.DataFrame, current_portfolio_df: pd.DataFrame)
     hist["Snapshot Date"] = pd.to_datetime(hist["Snapshot Date"], errors="coerce")
     hist = hist.dropna(subset=["Snapshot Date"])
 
-    current = current_portfolio_df[["Project", "Delay %", "Status", "Max Task Risk %", "P80"]].copy()
-    current.rename(columns={"Delay %": "Current Delay %", "Status": "Current Status",
-                            "Max Task Risk %": "Current Max Task Risk %", "P80": "Current P80"}, inplace=True)
+    current = current_portfolio_df[["Project", "Delay %", "Status"]].copy()
+    current.rename(columns={"Delay %": "Current Delay %", "Status": "Current Status"}, inplace=True)
 
     rows = []
     for proj in current["Project"].tolist():
@@ -137,7 +136,6 @@ def compute_trends(history_df: pd.DataFrame, current_portfolio_df: pd.DataFrame)
             continue
 
         latest = ph.iloc[-1]
-        prev = ph.iloc[-2] if len(ph) >= 2 else None
 
         curr_delay = float(current.loc[current["Project"] == proj, "Current Delay %"].iloc[0])
         curr_status = current.loc[current["Project"] == proj, "Current Status"].iloc[0]
@@ -156,8 +154,6 @@ def compute_trends(history_df: pd.DataFrame, current_portfolio_df: pd.DataFrame)
         now_bucket = status_bucket(str(curr_status))
         new_red = (now_bucket == "Red" and last_bucket != "Red")
 
-        prev_delay = float(prev["Delay %"]) if prev is not None else None
-
         rows.append({
             "Project": proj,
             "Current Status": curr_status,
@@ -167,10 +163,38 @@ def compute_trends(history_df: pd.DataFrame, current_portfolio_df: pd.DataFrame)
             "Δ vs Last": round(delta, 2),
             "Trend": arrow,
             "New Red?": "YES" if new_red else "",
-            "Prev Snapshot Delay %": "" if prev_delay is None else round(prev_delay, 2),
         })
 
     return pd.DataFrame(rows)
+
+# =========================
+# Cost of Delay (Step 4)
+# =========================
+
+def init_cost_overrides():
+    if "cost_per_day_overrides" not in st.session_state:
+        st.session_state["cost_per_day_overrides"] = {}  # {project_name: cost_per_day}
+
+def get_cost_per_day(project_name: str, default_cost: float) -> float:
+    init_cost_overrides()
+    v = st.session_state["cost_per_day_overrides"].get(project_name, None)
+    try:
+        if v is None:
+            return float(default_cost)
+        return float(v)
+    except Exception:
+        return float(default_cost)
+
+def set_cost_override(project_name: str, cost: float):
+    init_cost_overrides()
+    st.session_state["cost_per_day_overrides"][project_name] = float(cost)
+
+def expected_delay_days(planned: float, p80: float) -> float:
+    # Simple, explainable measure: expected "buffer overrun" at P80
+    return max(0.0, float(p80) - float(planned))
+
+def expected_delay_cost(delay_probability_pct: float, exp_delay_days: float, cost_per_day: float) -> float:
+    return (float(delay_probability_pct) / 100.0) * float(exp_delay_days) * float(cost_per_day)
 
 # =========================
 # Helpers
@@ -238,11 +262,9 @@ def init_overrides():
     if "overrides_by_project" not in st.session_state:
         st.session_state["overrides_by_project"] = {}
 
-
 def get_project_overrides(project_name: str):
     init_overrides()
     return st.session_state["overrides_by_project"].setdefault(project_name, {})
-
 
 def apply_overrides(df, project_overrides: dict):
     df2 = df.copy()
@@ -255,7 +277,6 @@ def apply_overrides(df, project_overrides: dict):
             for k, v in ov.items():
                 df2.at[i, k] = v
     return df2
-
 
 def any_row_has_pert_values(df):
     cols = ["Optimistic", "MostLikely", "Pessimistic"]
@@ -276,6 +297,7 @@ st.title("APRA — Project Risk Dashboard")
 
 init_overrides()
 init_history()
+init_cost_overrides()
 
 with st.sidebar:
     st.header("Navigation")
@@ -291,24 +313,20 @@ with st.sidebar:
 
     st.divider()
     st.header("Manager Thresholds")
-
-    st.caption("Task status uses Propagated Risk %.")
     task_green_lt = st.slider("Task Green if risk < (%)", 0, 100, 30, step=1)
     task_orange_lt = st.slider("Task Orange if risk < (%)", 0, 100, 60, step=1)
-
-    st.caption("Project status uses Delay % (Monte Carlo).")
     proj_green_lt = st.slider("Project Green if delay < (%)", 0, 100, 25, step=1)
     proj_orange_lt = st.slider("Project Orange if delay < (%)", 0, 100, 50, step=1)
 
-    if task_orange_lt < task_green_lt:
-        st.warning("Task thresholds: Orange threshold should be >= Green threshold.")
-    if proj_orange_lt < proj_green_lt:
-        st.warning("Project thresholds: Orange threshold should be >= Green threshold.")
+    st.divider()
+    st.header("Cost of Delay (Step 4)")
+    default_cost_per_day = st.number_input("Default cost per day ($)", min_value=0.0, value=2500.0, step=500.0)
+    st.caption("You can override cost/day per project in Portfolio view.")
 
     st.divider()
     st.header("Portfolio Filters")
     portfolio_status_filter = st.selectbox("Show projects", ["All", "Green", "Orange", "Red"], index=0)
-    portfolio_sort = st.selectbox("Sort projects by", ["Delay % (desc)", "Max Task Risk % (desc)", "Project (A→Z)"], index=0)
+    portfolio_sort = st.selectbox("Sort projects by", ["Expected Delay Cost (desc)", "Delay % (desc)", "Max Task Risk % (desc)", "Project (A→Z)"], index=0)
     min_top_task_risk = st.slider("Top risks: minimum task risk (%)", 0, 100, 50, step=5)
 
     st.divider()
@@ -318,13 +336,7 @@ with st.sidebar:
         history_load_from_uploaded(history_upload)
         st.success("History loaded.")
 
-    st.download_button(
-        "Download history CSV",
-        data=history_to_csv_bytes(),
-        file_name="apra_history.csv",
-        mime="text/csv"
-    )
-
+    st.download_button("Download history CSV", data=history_to_csv_bytes(), file_name="apra_history.csv", mime="text/csv")
     if st.button("Clear history"):
         st.session_state["apra_history"] = pd.DataFrame(columns=HISTORY_COLUMNS)
         st.success("History cleared.")
@@ -340,17 +352,11 @@ proj_orange = float(max(proj_green_lt, proj_orange_lt))
 # =========================
 
 projects = {}
-
 if use_demo:
     projects["Demo Project"] = pd.read_csv("sample_tasks.csv")
 elif uploaded_files and len(uploaded_files) > 0:
     for f in uploaded_files:
-        try:
-            df_tmp = pd.read_csv(f)
-            projects[f.name] = df_tmp
-        except Exception as e:
-            st.error(f"Failed to read {f.name}: {e}")
-            st.stop()
+        projects[f.name] = pd.read_csv(f)
 else:
     st.info("No files uploaded — using demo data")
     projects["Demo Project"] = pd.read_csv("sample_tasks.csv")
@@ -378,6 +384,10 @@ for name, df_tmp in projects.items():
 
     proj_stat = project_status(delay_pct, proj_green, proj_orange)
 
+    cost_day = get_cost_per_day(name, default_cost_per_day)
+    exp_days = expected_delay_days(summ["planned_days"], summ["p80_days"])
+    exp_cost = expected_delay_cost(delay_pct, exp_days, cost_day)
+
     summary_rows.append({
         "Status": proj_stat,
         "Bucket": status_bucket(proj_stat),
@@ -390,6 +400,9 @@ for name, df_tmp in projects.items():
         "Avg Task Risk %": round(avg_task_risk, 2),
         "Critical Path Tasks": len(cpath),
         "PERT?": "Yes" if any_row_has_pert_values(df_tmp) else "No",
+        "Cost/day ($)": round(cost_day, 2),
+        "Expected Delay Days": round(exp_days, 2),
+        "Expected Delay Cost ($)": round(exp_cost, 2),
     })
 
     dtop = df_an.sort_values("Propagated Risk %", ascending=False).head(3)
@@ -404,8 +417,12 @@ for name, df_tmp in projects.items():
         })
 
 portfolio_df = pd.DataFrame(summary_rows)
+
+# Sorting supports Step 4
 if not portfolio_df.empty:
-    if portfolio_sort == "Delay % (desc)":
+    if portfolio_sort == "Expected Delay Cost (desc)":
+        portfolio_df = portfolio_df.sort_values("Expected Delay Cost ($)", ascending=False)
+    elif portfolio_sort == "Delay % (desc)":
         portfolio_df = portfolio_df.sort_values("Delay %", ascending=False)
     elif portfolio_sort == "Max Task Risk % (desc)":
         portfolio_df = portfolio_df.sort_values("Max Task Risk %", ascending=False)
@@ -430,16 +447,38 @@ trend_df = compute_trends(st.session_state["apra_history"], portfolio_view_df)
 
 if view_mode == "Portfolio":
     st.subheader("Portfolio Summary")
+
+    # Portfolio rollups (Step 4)
+    if not portfolio_view_df.empty:
+        total_expected_cost = float(portfolio_view_df["Expected Delay Cost ($)"].sum())
+        c1, c2 = st.columns(2)
+        c1.metric("Total Expected Delay Cost ($)", f"{total_expected_cost:,.2f}")
+        c2.metric("Projects shown", int(len(portfolio_view_df)))
+
     cA, cB = st.columns([1, 3])
     with cA:
         if st.button("Add snapshot (Today)"):
-            history_add_snapshot(today, portfolio_view_df if not portfolio_view_df.empty else portfolio_df.drop(columns=["Bucket"], errors="ignore"))
+            history_add_snapshot(today, portfolio_view_df)
             st.success(f"Snapshot added for {today.isoformat()}.")
 
     if portfolio_view_df.empty:
         st.info("No projects match the current filter.")
     else:
         st.dataframe(style_status_col(portfolio_view_df, "Status"), use_container_width=True)
+
+        st.subheader("Cost Overrides (per project)")
+        st.caption("Set a project-specific cost/day and click Apply. This persists for this session; download/upload is added later in Step 6/7 if needed.")
+        proj_names = portfolio_view_df["Project"].tolist()
+        sel_proj = st.selectbox("Project to override cost/day", proj_names, index=0)
+        new_cost = st.number_input("Override cost/day ($)", min_value=0.0, value=float(get_cost_per_day(sel_proj, default_cost_per_day)), step=500.0)
+        if st.button("Apply cost override"):
+            set_cost_override(sel_proj, float(new_cost))
+            st.success(f"Cost/day override set for {sel_proj}.")
+
+    st.subheader("Top Cost Risks")
+    if not portfolio_view_df.empty:
+        cost_top = portfolio_view_df.sort_values("Expected Delay Cost ($)", ascending=False).head(10)
+        st.dataframe(cost_top[["Status","Project","Delay %","Expected Delay Days","Cost/day ($)","Expected Delay Cost ($)"]], use_container_width=True)
 
     st.subheader("Trend Summary (Drift + New Reds)")
     if trend_df.empty:
@@ -460,14 +499,14 @@ if view_mode == "Portfolio":
     st.dataframe(st.session_state["apra_history"], use_container_width=True)
 
 # =========================
-# View: Project details (Step 1 + Step 3)
+# View: Project details (Steps 1, 3, 4)
 # =========================
 
 else:
     st.subheader("Project Drill-down")
     selected_project = st.selectbox("Select a project", sorted(list(projects.keys())))
     df_in = projects[selected_project]
-    project_overrides = get_project_overrides(selected_project)
+    project_overrides = st.session_state.get("overrides_by_project", {}).setdefault(selected_project, {})
 
     # Trend chart (if history exists)
     hist = st.session_state["apra_history"]
@@ -476,65 +515,16 @@ else:
         proj_hist["Snapshot Date"] = pd.to_datetime(proj_hist["Snapshot Date"], errors="coerce")
         proj_hist = proj_hist.dropna(subset=["Snapshot Date"]).sort_values("Snapshot Date")
         st.subheader("Project Trend (Delay % over snapshots)")
-        chart_df = proj_hist.set_index("Snapshot Date")[["Delay %"]]
-        st.line_chart(chart_df)
+        st.line_chart(proj_hist.set_index("Snapshot Date")[["Delay %"]])
 
-    st.subheader("What-if controls (Selected project)")
-    st.caption("Override Optimistic / MostLikely / Pessimistic (and Progress) for a task. This does not edit your CSV file.")
+    # Run analysis (with overrides applied)
+    df_for_analysis = df_in.copy()
+    for i, r in df_for_analysis.iterrows():
+        t = str(r["Task"])
+        if t in project_overrides:
+            for k, v in project_overrides[t].items():
+                df_for_analysis.at[i, k] = v
 
-    colA, colB = st.columns([2, 1])
-    task_list = df_in["Task"].astype(str).tolist()
-    selected_task = colA.selectbox("Select task to override", task_list, index=0 if task_list else None)
-
-    with colB:
-        if st.button("Reset overrides (this project)"):
-            st.session_state["overrides_by_project"][selected_project] = {}
-            project_overrides = get_project_overrides(selected_project)
-            st.success("Overrides cleared.")
-
-    if selected_task:
-        row = df_in.loc[df_in["Task"].astype(str) == str(selected_task)].iloc[0]
-
-        def _val(x, default):
-            try:
-                if pd.isna(x) or str(x).strip() == "":
-                    return default
-                return float(x)
-            except Exception:
-                return default
-
-        cur_o = _val(row.get("Optimistic", ""), 1.0)
-        cur_m = _val(row.get("MostLikely", ""), max(cur_o, 2.0))
-        cur_p = _val(row.get("Pessimistic", ""), max(cur_m, 3.0))
-        cur_prog = float(row.get("Progress", 0))
-
-        st.markdown(f"**Selected task:** `{selected_task}`")
-
-        c1, c2, c3, c4 = st.columns(4)
-        new_o = c1.number_input("Optimistic (days)", min_value=0.5, value=float(cur_o), step=0.5, key=f"{selected_project}:{selected_task}:o")
-        new_m = c2.number_input("Most Likely (days)", min_value=0.5, value=float(cur_m), step=0.5, key=f"{selected_project}:{selected_task}:m")
-        new_p = c3.number_input("Pessimistic (days)", min_value=0.5, value=float(cur_p), step=0.5, key=f"{selected_project}:{selected_task}:p")
-        new_prog = c4.slider("Progress (%)", 0, 100, int(round(cur_prog)), step=1, key=f"{selected_project}:{selected_task}:prog")
-
-        if not (new_o <= new_m <= new_p):
-            st.error("Invalid PERT override: must satisfy Optimistic ≤ MostLikely ≤ Pessimistic.")
-        else:
-            colS1, colS2 = st.columns([1, 2])
-            if colS1.button("Apply override", key=f"{selected_project}:{selected_task}:apply"):
-                project_overrides[str(selected_task)] = {
-                    "Optimistic": float(new_o),
-                    "MostLikely": float(new_m),
-                    "Pessimistic": float(new_p),
-                    "Progress": float(new_prog),
-                }
-                st.success("Override applied.")
-
-            if colS2.button("Remove override", key=f"{selected_project}:{selected_task}:remove"):
-                project_overrides.pop(str(selected_task), None)
-                st.success("Override removed.")
-
-    # Run analysis with overrides applied
-    df_for_analysis = apply_overrides(df_in, project_overrides)
     df, critical_path, graph = analyze_project_from_df(df_for_analysis, today)
 
     with st.spinner("Running Monte Carlo for selected project..."):
@@ -545,6 +535,17 @@ else:
 
     st.markdown(f"## Project Status: {project_status(delay_pct_sel, proj_green, proj_orange)}")
 
+    # Step 4 metrics (Cost of Delay)
+    cost_day = get_cost_per_day(selected_project, default_cost_per_day)
+    exp_days = expected_delay_days(summary["planned_days"], summary["p80_days"])
+    exp_cost = expected_delay_cost(delay_pct_sel, exp_days, cost_day)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cost/day ($)", f"{cost_day:,.2f}")
+    c2.metric("Expected Delay Days (P80−Plan)", f"{exp_days:,.2f}")
+    c3.metric("Expected Delay Cost ($)", f"{exp_cost:,.2f}")
+
+    # Step 1: Root-cause
     explanation = explain_project_risk(
         df=df,
         critical_path=critical_path,
@@ -562,7 +563,6 @@ else:
     st.markdown("**Top risk drivers:**")
     for line in explanation["driver_bullets"]:
         st.markdown(line)
-    st.caption(explanation["meaning"])
 
     # Step 3: Action Prioritization
     st.subheader("Action Prioritization (Impact-ranked)")
@@ -577,14 +577,12 @@ else:
             candidate_tasks=5,
             scenario_sims=700,
         )
-
     if actions_df.empty:
         st.info("No actions generated.")
     else:
-        st.caption("Estimates are based on lightweight Monte Carlo scenarios; use as prioritization guidance.")
         st.dataframe(actions_df, use_container_width=True)
 
-    # Metrics
+    # Core metrics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Planned (days)", summary["planned_days"])
     c2.metric("P50", summary["p50_days"])
@@ -594,7 +592,6 @@ else:
     st.subheader("Task Table")
     df_disp = df.copy()
     df_disp["Status"] = df_disp["Propagated Risk %"].apply(lambda x: task_status(float(x), task_green, task_orange))
-
     display_cols = [
         "Status", "Task", "Start", "Due", "Progress",
         "Optimistic", "MostLikely", "Pessimistic",
@@ -607,9 +604,3 @@ else:
         st.pyplot(make_task_risk_fig(df), clear_figure=True)
     with right:
         st.pyplot(make_monte_carlo_fig(samples, planned), clear_figure=True)
-
-    st.subheader("Active overrides (selected project)")
-    if project_overrides:
-        st.json(project_overrides)
-    else:
-        st.caption("No overrides applied.")
