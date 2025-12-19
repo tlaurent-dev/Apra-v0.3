@@ -163,8 +163,6 @@ def _to_float_or_none(x):
 
 
 def pert_sample(o, m, p):
-    import random
-
     if o is None or m is None or p is None:
         return None
     if not (o <= m <= p):
@@ -225,7 +223,7 @@ def monte_carlo_project_duration(df, graph, sims=5000, use_propagated=True, seed
             start_time = max([finish.get(d, 0.0) for d in deps], default=0.0)
 
             row = df.loc[df["Task"] == t].iloc[0]
-            dur = task_duration_for_mc(row, durations[t], risk_map.get(t, 0.0))
+            dur = task_duration_for_mc(row, durations[t], float(risk_map.get(t, 0.0)))
 
             finish[t] = start_time + dur
 
@@ -264,12 +262,6 @@ def _pert_width_days(row):
 def explain_project_risk(df, critical_path, graph, mc_summary,
                          task_green_lt=30, task_orange_lt=60,
                          proj_green_lt=25, proj_orange_lt=50):
-    """
-    Deterministic root-cause explanation:
-    - identifies top risk drivers
-    - classifies drivers: progress lag, dependency amplification, uncertainty
-    - produces a meeting-ready summary
-    """
     delay_pct = float(mc_summary["delay_probability_pct"])
     if delay_pct < proj_green_lt:
         proj_status = "On track"
@@ -278,7 +270,6 @@ def explain_project_risk(df, critical_path, graph, mc_summary,
     else:
         proj_status = "High risk"
 
-    # Driver score: prioritize propagated risk + critical path + low progress
     df2 = df.copy()
     df2["Progress"] = df2["Progress"].astype(float)
     df2["Propagated Risk %"] = df2["Propagated Risk %"].astype(float)
@@ -300,30 +291,21 @@ def explain_project_risk(df, critical_path, graph, mc_summary,
         prog = float(r["Progress"])
         on_cp = bool(r["On Critical Path"])
 
-        # Classify main driver
         reasons = []
-
-        # 1) Progress lag driver
         if base >= task_orange_lt or (base >= task_green_lt and prog < 80):
             reasons.append("progress lag")
 
-        # 2) Dependency amplification driver
         deps = graph.get(t, [])
-        if deps:
-            # amplification if propagated significantly higher than base
-            if prop - base >= 10:
-                reasons.append("dependency amplification")
+        if deps and (prop - base >= 10):
+            reasons.append("dependency amplification")
 
-        # 3) Uncertainty driver (PERT width)
         w = _pert_width_days(r)
         if w is not None and w >= 6:
             reasons.append("high uncertainty (PERT range)")
 
         if not reasons:
-            # default reason
             reasons.append("elevated propagated risk")
 
-        # Status label from task thresholds
         if prop < task_green_lt:
             t_status = "On track"
         elif prop < task_orange_lt:
@@ -342,7 +324,6 @@ def explain_project_risk(df, critical_path, graph, mc_summary,
             "reasons": reasons,
         })
 
-    # Compose narrative
     cp_text = " → ".join(critical_path) if critical_path else "(none)"
     headline = f"Project status is **{proj_status}** with an estimated **{delay_pct}%** probability of finishing later than the baseline plan."
 
@@ -356,7 +337,7 @@ def explain_project_risk(df, critical_path, graph, mc_summary,
 
     meaning = (
         "This risk profile is primarily driven by a small number of high-impact tasks. "
-        "Prioritizing corrective action on these drivers will typically yield the fastest reduction in overall delay probability."
+        "Corrective action on these drivers typically yields the fastest reduction in overall delay probability."
     )
 
     return {
@@ -368,7 +349,146 @@ def explain_project_risk(df, critical_path, graph, mc_summary,
     }
 
 # ======================================================
-# Streamlit-safe figures (no disk writes)
+# Action Prioritization (Step 3)
+# ======================================================
+
+def _recompute_risks_from_progress(df, graph, today):
+    df2 = df.copy()
+    df2["Base Risk %"] = df2.apply(lambda r: calculate_base_risk(r, today), axis=1)
+    propagated = propagate_risk(df2, graph)
+    df2["Propagated Risk %"] = df2["Task"].map(propagated)
+    return df2
+
+
+def _apply_duration_reduction(df, task_name: str, reduction_pct: float):
+    """
+    Reduce PERT (O/M/P) if present; otherwise reduce Due-Start by shifting Due earlier.
+    This is a simulation-only scenario. It does not guarantee realism; it is meant as an impact estimate.
+    """
+    df2 = df.copy()
+    mask = df2["Task"].astype(str) == str(task_name)
+    if not mask.any():
+        return df2
+
+    row = df2.loc[mask].iloc[0]
+    o = _to_float_or_none(row.get("Optimistic"))
+    m = _to_float_or_none(row.get("MostLikely"))
+    p = _to_float_or_none(row.get("Pessimistic"))
+
+    factor = max(0.0, 1.0 - reduction_pct / 100.0)
+
+    if o is not None and m is not None and p is not None and (o <= m <= p):
+        df2.loc[mask, "Optimistic"] = max(0.5, o * factor)
+        df2.loc[mask, "MostLikely"] = max(0.5, m * factor)
+        df2.loc[mask, "Pessimistic"] = max(0.5, p * factor)
+        return df2
+
+    # fallback: shift Due earlier by same % of duration (minimum 1 day duration)
+    try:
+        start_dt = pd.to_datetime(row["Start"])
+        due_dt = pd.to_datetime(row["Due"])
+        dur = max((due_dt - start_dt).days, 1)
+        new_dur = max(int(round(dur * factor)), 1)
+        new_due = start_dt + pd.Timedelta(days=new_dur)
+        df2.loc[mask, "Due"] = new_due.date().isoformat()
+    except Exception:
+        pass
+
+    return df2
+
+
+def _apply_progress_increase(df, task_name: str, increase_pts: float):
+    df2 = df.copy()
+    mask = df2["Task"].astype(str) == str(task_name)
+    if not mask.any():
+        return df2
+    try:
+        cur = float(df2.loc[mask, "Progress"].iloc[0])
+        df2.loc[mask, "Progress"] = max(0.0, min(100.0, cur + increase_pts))
+    except Exception:
+        pass
+    return df2
+
+
+def recommend_actions(df, graph, critical_path, today,
+                      baseline_summary,
+                      max_actions=5,
+                      candidate_tasks=5,
+                      scenario_sims=700,
+                      seed_base=200):
+    """
+    Compute impact-ranked actions by running lightweight MC scenarios.
+
+    Actions tried per candidate task:
+      A) Reduce duration by 10%
+      B) Increase progress by +10 points
+
+    Ranked by reduction in Delay % vs baseline.
+    """
+    baseline_delay = float(baseline_summary["delay_probability_pct"])
+
+    df2 = df.copy()
+    df2["Propagated Risk %"] = df2["Propagated Risk %"].astype(float)
+    df2["Progress"] = df2["Progress"].astype(float)
+
+    # Candidate tasks: high propagated risk + critical path preference
+    df2["DriverScore"] = df2["Propagated Risk %"] + df2["On Critical Path"].astype(int) * 15 + (100 - df2["Progress"]) * 0.15
+    candidates = df2.sort_values("DriverScore", ascending=False).head(candidate_tasks)["Task"].astype(str).tolist()
+
+    actions = []
+
+    def run_scenario(df_s, scenario_seed):
+        # Recompute risks if progress changed; for duration reduction we keep risks same
+        planned, samples = monte_carlo_project_duration(df_s, graph, sims=scenario_sims, seed=scenario_seed)
+        summ = summarize_samples(planned, samples)
+        return float(summ["delay_probability_pct"]), float(summ["p80_days"]), float(summ["p50_days"])
+
+    for i, t in enumerate(candidates):
+        # Scenario A: reduce duration by 10%
+        df_a = _apply_duration_reduction(df, t, reduction_pct=10.0)
+        # duration change does not alter base risk; keep existing risk columns
+        delay_a, p80_a, p50_a = run_scenario(df_a, seed_base + 10 * i + 1)
+        impact_a = baseline_delay - delay_a
+        actions.append({
+            "Action": f"Reduce duration 10%: {t}",
+            "Task": t,
+            "Type": "Duration",
+            "Estimated Delay % (after)": round(delay_a, 2),
+            "Δ Delay %": round(impact_a, 2),
+            "P50 (after)": round(p50_a, 2),
+            "P80 (after)": round(p80_a, 2),
+            "Notes": "Reduces O/M/P if PERT exists; otherwise shifts Due earlier (estimate)."
+        })
+
+        # Scenario B: increase progress by +10 points (recompute risks)
+        df_b = _apply_progress_increase(df, t, increase_pts=10.0)
+        df_b = _recompute_risks_from_progress(df_b, graph, today=today)
+        delay_b, p80_b, p50_b = run_scenario(df_b, seed_base + 10 * i + 2)
+        impact_b = baseline_delay - delay_b
+        actions.append({
+            "Action": f"Increase progress +10 pts: {t}",
+            "Task": t,
+            "Type": "Progress",
+            "Estimated Delay % (after)": round(delay_b, 2),
+            "Δ Delay %": round(impact_b, 2),
+            "P50 (after)": round(p50_b, 2),
+            "P80 (after)": round(p80_b, 2),
+            "Notes": "Recomputes base+propagated risk after progress change (estimate)."
+        })
+
+    actions_df = pd.DataFrame(actions)
+
+    # Sort by best improvement (largest reduction in delay)
+    actions_df = actions_df.sort_values("Δ Delay %", ascending=False)
+
+    # Keep only actions that help (positive improvement), otherwise still show top few but flagged
+    actions_df["Helps?"] = actions_df["Δ Delay %"].apply(lambda x: "YES" if x > 0 else "")
+
+    return actions_df.head(max_actions)
+
+
+# ======================================================
+# Streamlit-safe figures
 # ======================================================
 
 def make_task_risk_fig(df):
