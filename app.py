@@ -28,11 +28,12 @@ def init_ui_settings():
     st.session_state.setdefault("ui_font", "System")
     st.session_state.setdefault("ui_density", "Comfortable")
 
+    # Safety: if an old session stored a removed theme, reset it
+    if st.session_state.get("ui_theme") not in THEMES:
+        st.session_state["ui_theme"] = "Professional Light"
 
 THEMES = {
     "Professional Light": {"bg": "#ffffff", "panel": "#f7f7f9", "text": "#111827", "grid": "#e5e7eb"},
-    "Executive Dark": {"bg": "#0f172a", "panel": "#111827", "text": "#f9fafb", "grid": "#334155"},
-    "High Contrast": {"bg": "#0b0b0b", "panel": "#141414", "text": "#ffffff", "grid": "#6b7280"},
     "Minimal Gray": {"bg": "#f3f4f6", "panel": "#ffffff", "text": "#111827", "grid": "#d1d5db"},
 }
 
@@ -48,83 +49,170 @@ DENSITY = {
 }
 
 def apply_ui_theme():
+    """
+    Production-safe UI theming via CSS injection.
+
+    Design principles:
+    - Avoid f-strings inside CSS to prevent brace-related syntax issues.
+    - Use explicit placeholder replacement (no Template dependency).
+    - Keep business logic untouched: styling only.
+    - Ensure sidebar + BaseWeb widgets remain readable in all themes.
+    """
     t = THEMES.get(st.session_state.get("ui_theme", "Professional Light"), THEMES["Professional Light"])
     font = FONTS.get(st.session_state.get("ui_font", "System"), FONTS["System"])
     d = DENSITY.get(st.session_state.get("ui_density", "Comfortable"), DENSITY["Comfortable"])
 
-    st.markdown(
-        f"""
-        <style>
-          :root {{
-            --apra-bg: {t["bg"]};
-            --apra-panel: {t["panel"]};
-            --apra-text: {t["text"]};
-            --apra-grid: {t["grid"]};
-            --apra-font-size: {d["font"]};
-            --apra-pad: {d["pad"]};
-          }}
+    css = r"""
+    <style>
+      :root {
+        --apra-bg: __APRA_BG__;
+        --apra-panel: __APRA_PANEL__;
+        --apra-text: __APRA_TEXT__;
+        --apra-grid: __APRA_GRID__;
+        --apra-font-size: __APRA_FONT_SIZE__;
+        --apra-pad: __APRA_PAD__;
+        --apra-font-family: __APRA_FONT_FAMILY__;
+      }
 
-          html, body, [class*="stApp"] {{
-            background: var(--apra-bg) !important;
-            color: var(--apra-text) !important;
-            font-family: {font} !important;
-            font-size: var(--apra-font-size) !important;
-          }}
+      html, body, [class*="stApp"] {
+        background: var(--apra-bg) !important;
+        color: var(--apra-text) !important;
+        font-family: var(--apra-font-family) !important;
+        font-size: var(--apra-font-size) !important;
+      }
 
-          [data-testid="stSidebar"] {{
-            background: var(--apra-panel) !important;
-            border-right: 1px solid var(--apra-grid) !important;
-          }}
+      /* Sidebar container */
+      [data-testid="stSidebar"] {
+        background: var(--apra-panel) !important;
+        border-right: 1px solid var(--apra-grid) !important;
+      }
 
-          /* Metric cards */
-          [data-testid="stMetric"] {{
-            background: var(--apra-panel) !important;
-            border: 1px solid var(--apra-grid) !important;
-            border-radius: 14px !important;
-            padding: var(--apra-pad) !important;
-          }}
+      /* ===============================
+         Sidebar readability (theme-safe)
+         =============================== */
 
-          /* Buttons */
-          .stButton > button {{
-            border-radius: 10px !important;
-            border: 1px solid var(--apra-grid) !important;
-            padding: calc(var(--apra-pad) * 0.7) var(--apra-pad) !important;
-          }}
+      /* Ensure common sidebar text nodes are readable (does NOT force backgrounds) */
+      [data-testid="stSidebar"] h1,
+      [data-testid="stSidebar"] h2,
+      [data-testid="stSidebar"] h3,
+      [data-testid="stSidebar"] h4,
+      [data-testid="stSidebar"] h5,
+      [data-testid="stSidebar"] h6,
+      [data-testid="stSidebar"] p,
+      [data-testid="stSidebar"] span,
+      [data-testid="stSidebar"] small,
+      [data-testid="stSidebar"] label {
+        color: var(--apra-text) !important;
+        opacity: 1 !important;
+      }
 
-          /* Inputs */
-          input, textarea {{
-            border-radius: 10px !important;
-          }}
-        
-          /* Improve contrast for common Streamlit elements */
-          a, a:visited {{ color: #60a5fa !important; }}
-          .stMarkdown, .stText, .stCaption, .stMarkdown p, .stMarkdown li {{ color: var(--apra-text) !important; }}
-          .stCaption {{ opacity: 0.88; }}
+      [data-testid="stSidebar"] hr {
+        border-color: var(--apra-grid) !important;
+        opacity: 0.9 !important;
+      }
 
-          /* Widget labels */
-          label, .stSelectbox label, .stRadio label, .stSlider label, .stNumberInput label {{
-            color: var(--apra-text) !important;
-          }}
+      /* ===============================
+         Widget readability (Streamlit/BaseWeb)
+         =============================== */
 
-          /* Dataframe container (outer frame) */
-          [data-testid="stDataFrame"] {{
-            background: var(--apra-panel) !important;
-            border: 1px solid var(--apra-grid) !important;
-            border-radius: 14px !important;
-            padding: calc(var(--apra-pad) * 0.6) !important;
-          }}
+      /* BaseWeb select / input shells in the sidebar */
+      [data-testid="stSidebar"] div[data-baseweb="select"] > div,
+      [data-testid="stSidebar"] div[data-baseweb="input"] > div {
+        background-color: var(--apra-panel) !important;
+        border: 1px solid var(--apra-grid) !important;
+      }
 
-          /* Expanders */
-          [data-testid="stExpander"] {{
-            background: var(--apra-panel) !important;
-            border: 1px solid var(--apra-grid) !important;
-            border-radius: 14px !important;
-          }}
+      /* Selected value + input text (sidebar) */
+      [data-testid="stSidebar"] div[data-baseweb="select"] span,
+      [data-testid="stSidebar"] div[data-baseweb="select"] input,
+      [data-testid="stSidebar"] div[data-baseweb="input"] input {
+        color: var(--apra-text) !important;
+        -webkit-text-fill-color: var(--apra-text) !important;
+        caret-color: var(--apra-text) !important;
+      }
 
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+      /* Dropdown popover/menu (applies app-wide) */
+      div[data-baseweb="popover"],
+      div[data-baseweb="menu"] {
+        background-color: var(--apra-panel) !important;
+        border: 1px solid var(--apra-grid) !important;
+      }
+
+      div[data-baseweb="menu"] *,
+      div[role="listbox"] *,
+      div[role="option"] {
+        color: var(--apra-text) !important;
+        opacity: 1 !important;
+      }
+
+      /* Placeholder text */
+      [data-testid="stSidebar"] input::placeholder,
+      [data-testid="stSidebar"] textarea::placeholder,
+      [data-testid="stSidebar"] div[data-baseweb="select"] input::placeholder {
+        color: rgba(127, 127, 127, 0.95) !important;
+        opacity: 1 !important;
+      }
+
+      /* Metric cards */
+      [data-testid="stMetric"] {
+        background: var(--apra-panel) !important;
+        border: 1px solid var(--apra-grid) !important;
+        border-radius: 14px !important;
+        padding: var(--apra-pad) !important;
+      }
+
+      /* Buttons */
+      .stButton > button {
+        background: var(--apra-panel) !important;
+        color: var(--apra-text) !important;
+        border-radius: 10px !important;
+        border: 1px solid var(--apra-grid) !important;
+        padding: calc(var(--apra-pad) * 0.7) var(--apra-pad) !important;
+      }
+
+      /* Inputs (general) */
+      input, textarea {
+        border-radius: 10px !important;
+        color: var(--apra-text) !important;
+      }
+
+      /* Links */
+      a, a:visited { color: #60a5fa !important; }
+
+      /* Text blocks */
+      .stMarkdown, .stText, .stCaption, .stMarkdown p, .stMarkdown li {
+        color: var(--apra-text) !important;
+      }
+      .stCaption { opacity: 0.88; }
+
+      /* Dataframe container (outer frame) */
+      [data-testid="stDataFrame"] {
+        background: var(--apra-panel) !important;
+        border: 1px solid var(--apra-grid) !important;
+        border-radius: 14px !important;
+        padding: calc(var(--apra-pad) * 0.6) !important;
+      }
+
+      /* Expanders */
+      [data-testid="stExpander"] {
+        background: var(--apra-panel) !important;
+        border: 1px solid var(--apra-grid) !important;
+        border-radius: 14px !important;
+      }
+    </style>
+    """
+
+    # Safe placeholder substitution (no brace escaping issues)
+    css = (css
+           .replace("__APRA_BG__", str(t["bg"]))
+           .replace("__APRA_PANEL__", str(t["panel"]))
+           .replace("__APRA_TEXT__", str(t["text"]))
+           .replace("__APRA_GRID__", str(t["grid"]))
+           .replace("__APRA_FONT_SIZE__", str(d["font"]))
+           .replace("__APRA_PAD__", str(d["pad"]))
+           .replace("__APRA_FONT_FAMILY__", str(font)))
+
+    st.markdown(css, unsafe_allow_html=True)
 
 # =========================
 # Status + styling
@@ -167,7 +255,13 @@ def style_status_col(df: pd.DataFrame, col_name: str = "Status"):
         if isinstance(v, str) and "🟥" in v:
             return "background-color: #FFBABA;"
         return ""
-    return df.style.applymap(_style, subset=[col_name])
+
+    # Enforce 2-decimal formatting for numeric columns at render time (display only).
+    sty = df.style.applymap(_style, subset=[col_name])
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if num_cols:
+        sty = sty.format({c: "{:,.2f}" for c in num_cols})
+    return sty
 
 # =========================
 # Trend history (Step 2)
@@ -481,6 +575,26 @@ def make_project_weekly_pdf(run_dt: datetime, portfolio_df: pd.DataFrame, top_co
     return buff.getvalue()
 
 # =========================
+# Display rounding (no logic changes)
+# =========================
+
+def round_numeric_cols(df: pd.DataFrame, cols=None, n: int = 2) -> pd.DataFrame:
+    """
+    Round numeric columns for display/export only.
+    This function must NOT be used on inputs to core calculations.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df.copy()
+    if cols is None:
+        cols_to_round = list(out.select_dtypes(include="number").columns)
+    else:
+        cols_to_round = [c for c in cols if c in out.columns]
+    for c in cols_to_round:
+        out[c] = pd.to_numeric(out[c], errors="coerce").round(n)
+    return out
+
+# =========================
 # Helpers
 # =========================
 
@@ -711,6 +825,21 @@ if not top_tasks_df.empty:
 trend_df = compute_trends(st.session_state["apra_history"], portfolio_view_df)
 open_items_all = pd.concat(all_open_items, ignore_index=True) if all_open_items else pd.DataFrame()
 
+# Display-only rounding (does not affect computations)
+PORTFOLIO_NUM_COLS = [
+    "Planned (days)", "P50", "P80", "Delay %",
+    "Max Task Risk %", "Avg Task Risk %",
+    "Cost/day ($)", "Expected Delay Days", "Expected Delay Cost ($)"
+]
+TOP_TASKS_NUM_COLS = ["Propagated Risk %", "Progress %"]
+TREND_NUM_COLS = ["Current Delay %", "Last Delay %", "Δ vs Last"]
+OPEN_ITEMS_NUM_COLS = ["Project Delay %", "Propagated Risk %", "Base Risk %", "Progress", "Attributed Cost ($)"]
+
+portfolio_view_disp = round_numeric_cols(portfolio_view_df, PORTFOLIO_NUM_COLS, n=2) if isinstance(portfolio_view_df, pd.DataFrame) else portfolio_view_df
+top_tasks_disp = round_numeric_cols(top_tasks_df, TOP_TASKS_NUM_COLS, n=2) if isinstance(top_tasks_df, pd.DataFrame) else top_tasks_df
+trend_disp = round_numeric_cols(trend_df, TREND_NUM_COLS, n=2) if isinstance(trend_df, pd.DataFrame) else trend_df
+open_items_disp = round_numeric_cols(open_items_all, OPEN_ITEMS_NUM_COLS, n=2) if isinstance(open_items_all, pd.DataFrame) else open_items_all
+
 # =========================
 # View: Portfolio
 # =========================
@@ -733,7 +862,7 @@ if view_mode == "Portfolio":
     if portfolio_view_df.empty:
         st.info("No projects match the current filter.")
     else:
-        st.dataframe(style_status_col(portfolio_view_df, "Status"), use_container_width=True)
+        st.dataframe(style_status_col(portfolio_view_disp, "Status"), use_container_width=True)
 
         st.subheader("Cost Overrides (per project)")
         proj_names = portfolio_view_df["Project"].tolist()
@@ -745,15 +874,15 @@ if view_mode == "Portfolio":
 
     st.subheader("Top Cost Risks")
     if not portfolio_view_df.empty:
-        cost_top = portfolio_view_df.sort_values("Expected Delay Cost ($)", ascending=False).head(10)
+        cost_top = portfolio_view_disp.sort_values("Expected Delay Cost ($)", ascending=False).head(10)
         st.dataframe(cost_top[["Status","Project","Delay %","Expected Delay Days","Cost/day ($)","Expected Delay Cost ($)"]], use_container_width=True)
 
     st.subheader("Trend Summary (Drift + New Reds)")
     if trend_df.empty:
         st.info("Add at least one snapshot to enable trends.")
     else:
-        st.dataframe(trend_df, use_container_width=True)
-        new_reds = trend_df[trend_df["New Red?"] == "YES"]
+        st.dataframe(trend_disp.style.format(precision=2), use_container_width=True)
+        new_reds = trend_disp[trend_disp["New Red?"] == "YES"]
         if not new_reds.empty:
             st.warning(f"New Reds detected: {', '.join(new_reds['Project'].tolist())}")
 
@@ -761,7 +890,7 @@ if view_mode == "Portfolio":
     if top_tasks_df.empty:
         st.info("No tasks match the current minimum risk filter.")
     else:
-        st.dataframe(style_status_col(top_tasks_df, "Status"), use_container_width=True)
+        st.dataframe(style_status_col(top_tasks_disp, "Status"), use_container_width=True)
 
 # =========================
 # View: Project details
@@ -826,10 +955,11 @@ elif view_mode == "Project details":
     if actions_df.empty:
         st.info("No actions generated.")
     else:
-        st.dataframe(actions_df, use_container_width=True)
+        st.dataframe(round_numeric_cols(actions_df, cols=None, n=2).style.format(precision=2), use_container_width=True)
 
     st.subheader("Task Table (with Ownership)")
     df_disp = ensure_owner_columns(df.copy())
+    df_disp = round_numeric_cols(df_disp, cols=["Progress","Base Risk %","Propagated Risk %"], n=2)
     df_disp["Status"] = df_disp["Propagated Risk %"].apply(lambda x: task_status(float(x), task_green, task_orange))
 
     display_cols = [
@@ -859,11 +989,11 @@ elif view_mode == "Owners":
 
     owner_field = st.radio("Group by", ["Risk Owner", "Task Owner"], index=0, horizontal=True)
 
-    owners = sorted(open_items_all[owner_field].astype(str).fillna("Unassigned").replace({"": "Unassigned"}).unique().tolist())
+    owners = sorted(open_items_disp[owner_field].astype(str).fillna("Unassigned").replace({"": "Unassigned"}).unique().tolist())
     selected_owner = st.selectbox("Owner", ["All"] + owners, index=0)
     severity_filter = st.multiselect("Severity", ["🟥 High risk", "🟧 Recoverable"], default=["🟥 High risk", "🟧 Recoverable"])
 
-    d = open_items_all.copy()
+    d = open_items_disp.copy()
     d[owner_field] = d[owner_field].astype(str).fillna("Unassigned").replace({"": "Unassigned"})
     if selected_owner != "All":
         d = d[d[owner_field] == selected_owner]
@@ -871,10 +1001,11 @@ elif view_mode == "Owners":
 
     st.subheader("Owner Summary")
     summary_by_owner = summarize_open_items_by_owner(d, owner_field=owner_field)
+    summary_by_owner = round_numeric_cols(summary_by_owner, cols=["Attributed_Cost_USD","Avg_Task_Risk_Pct"], n=2)
     if summary_by_owner.empty:
         st.info("No items match the current filters.")
     else:
-        st.dataframe(summary_by_owner, use_container_width=True)
+        st.dataframe(summary_by_owner.style.format(precision=2), use_container_width=True)
 
     st.subheader("Open Items Detail")
     show_cols = [
@@ -883,7 +1014,7 @@ elif view_mode == "Owners":
         "Propagated Risk %", "Progress", "On Critical Path",
         "Attributed Cost ($)", "Project Delay %", "Start", "Due"
     ]
-    st.dataframe(d[show_cols].sort_values(["Attributed Cost ($)"], ascending=False), use_container_width=True)
+    st.dataframe(d[show_cols].sort_values(["Attributed Cost ($)"], ascending=False).style.format(precision=2), use_container_width=True)
 
 # =========================
 # View: Reports (Step 6)
@@ -903,19 +1034,21 @@ else:
             owner_field = st.radio("Group by", ["Risk Owner", "Task Owner"], index=0, horizontal=True, key="rep_owner_group")
             severity_filter = st.multiselect("Include severities", ["🟥 High risk", "🟧 Recoverable"], default=["🟥 High risk", "🟧 Recoverable"], key="rep_owner_sev")
 
-            d = open_items_all.copy()
+            d = open_items_disp.copy()
             d = d[d["Task Status"].isin(severity_filter)]
 
             owner_summary = summarize_open_items_by_owner(d, owner_field=owner_field)
-            d_detail = d.sort_values("Attributed Cost ($)", ascending=False)
+            # Display/export rounding only
+            owner_summary = round_numeric_cols(owner_summary, cols=["Attributed_Cost_USD","Avg_Task_Risk_Pct"], n=2)
+            d_detail = round_numeric_cols(d.sort_values("Attributed Cost ($)", ascending=False), cols=OPEN_ITEMS_NUM_COLS, n=2)
 
             c1, c2, c3 = st.columns(3)
             c1.metric("Open items", int(len(d_detail)))
             c2.metric("Total attributed cost ($)", f"{float(d_detail['Attributed Cost ($)'].sum()):,.2f}" if not d_detail.empty else "0.00")
             c3.metric("Owners", int(owner_summary["Owner"].nunique()) if not owner_summary.empty else 0)
 
-            st.dataframe(owner_summary, use_container_width=True)
-            st.dataframe(d_detail, use_container_width=True)
+            st.dataframe(owner_summary.style.format(precision=2), use_container_width=True)
+            st.dataframe(d_detail.style.format(precision=2), use_container_width=True)
 
             st.download_button(
                 "Download Owner Summary CSV",
@@ -940,9 +1073,9 @@ else:
         if portfolio_view_df.empty:
             st.info("No portfolio data loaded.")
         else:
-            portfolio_out = portfolio_view_df.copy()
-            top_cost = portfolio_out.sort_values("Expected Delay Cost ($)", ascending=False).head(10)
-            trends_out = trend_df.copy() if isinstance(trend_df, pd.DataFrame) else pd.DataFrame()
+            portfolio_out = portfolio_view_disp.copy()
+            top_cost = round_numeric_cols(portfolio_out.sort_values("Expected Delay Cost ($)", ascending=False).head(10), cols=PORTFOLIO_NUM_COLS, n=2)
+            trends_out = trend_disp.copy() if isinstance(trend_disp, pd.DataFrame) else pd.DataFrame()
 
             total_expected_cost = float(portfolio_out["Expected Delay Cost ($)"].sum()) if "Expected Delay Cost ($)" in portfolio_out.columns else 0.0
             c1, c2 = st.columns(2)
@@ -959,7 +1092,7 @@ else:
             if trends_out.empty:
                 st.caption("No trends available (add at least one snapshot).")
             else:
-                st.dataframe(trends_out, use_container_width=True)
+                st.dataframe(trends_out.style.format(precision=2), use_container_width=True)
 
             st.download_button(
                 "Download Portfolio CSV",
