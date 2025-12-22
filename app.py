@@ -881,10 +881,64 @@ if view_mode == "Portfolio":
     if trend_df.empty:
         st.info("Add at least one snapshot to enable trends.")
     else:
-        st.dataframe(trend_disp.style.format(precision=2), use_container_width=True)
-        new_reds = trend_disp[trend_disp["New Red?"] == "YES"]
-        if not new_reds.empty:
-            st.warning(f"New Reds detected: {', '.join(new_reds['Project'].tolist())}")
+        # Ensure numeric Δ exists and is rounded for display
+        td = trend_disp.copy()
+        if "Δ vs Last" in td.columns:
+            td["Δ vs Last"] = pd.to_numeric(td["Δ vs Last"], errors="coerce")
+
+        st.dataframe(td.style.format(precision=2), use_container_width=True)
+
+        # --- KPI tiles ---
+        new_reds_df = td[td["New Red?"] == "YES"].copy()
+        worsening = td.sort_values("Δ vs Last", ascending=False).head(5).copy()
+        improving = td.sort_values("Δ vs Last", ascending=True).head(5).copy()
+
+        largest_worsen = float(worsening["Δ vs Last"].iloc[0]) if (not worsening.empty and pd.notna(worsening["Δ vs Last"].iloc[0])) else 0.0
+        largest_improve = float(improving["Δ vs Last"].iloc[0]) if (not improving.empty and pd.notna(improving["Δ vs Last"].iloc[0])) else 0.0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("New Reds", int(len(new_reds_df)))
+        c2.metric("Largest Worsening Δ", f"{largest_worsen:,.2f}")
+        c3.metric("Largest Improvement Δ", f"{largest_improve:,.2f}")
+        c4.metric("Projects with trends", int(len(td)))
+
+        # --- New Reds (Escalate) ---
+        st.markdown("### New Reds (Escalate now)")
+        if new_reds_df.empty:
+            st.caption("No new Reds since the last snapshot.")
+        else:
+            st.warning("Escalate these projects: " + ", ".join(new_reds_df["Project"].astype(str).tolist()))
+            show_cols = ["Project", "Current Status", "Current Delay %", "Last Snapshot Date", "Last Delay %", "Δ vs Last", "Trend"]
+            for c in show_cols:
+                if c not in new_reds_df.columns:
+                    new_reds_df[c] = ""
+            st.dataframe(new_reds_df[show_cols].style.format(precision=2), use_container_width=True)
+
+        # --- Biggest Worsening / Improving ---
+        st.markdown("### Biggest Drift (since last snapshot)")
+        left, right = st.columns(2)
+
+        with left:
+            st.markdown("**Top Worsening**")
+            if worsening.empty:
+                st.caption("No trend data.")
+            else:
+                show_cols = ["Project", "Current Status", "Current Delay %", "Last Delay %", "Δ vs Last", "Trend"]
+                for c in show_cols:
+                    if c not in worsening.columns:
+                        worsening[c] = ""
+                st.dataframe(worsening[show_cols].style.format(precision=2), use_container_width=True)
+
+        with right:
+            st.markdown("**Top Improving**")
+            if improving.empty:
+                st.caption("No trend data.")
+            else:
+                show_cols = ["Project", "Current Status", "Current Delay %", "Last Delay %", "Δ vs Last", "Trend"]
+                for c in show_cols:
+                    if c not in improving.columns:
+                        improving[c] = ""
+                st.dataframe(improving[show_cols].style.format(precision=2), use_container_width=True)
 
     st.subheader("Top Risks Across Portfolio (Top 10 tasks)")
     if top_tasks_df.empty:
